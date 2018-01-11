@@ -1,0 +1,121 @@
+#created by francois scheurer on 20120828
+#
+#note:
+#  -be careful with trailing spaces, '- * ' is different from '- *'
+#  -rsync stops at first matched rule and ignore the rest
+#  -rsync descends iteratively the folders-arborescence
+#  -'**' matches also zero, one or several '/'
+#  -get the list of all root files/folders
+#     pdsh -f 1 -w server[1-22] 'ls -la / | sed -e "s/  */ /g" | cut -d" " -f9-' | cut -d" " -f2- | sort -u
+#  -include all folders with '+ */' (missing this rule implies that '- *' will override all the inclusions of any subfolders)
+#  -exclude all non explicited files with '- *'
+#  -exclude everything except /etc/ssh: '+ /etc/ssh/** \ + */ \ - *'
+#  -exclude content of /tmp but include foldername: '- /tmp/* \ + */'
+#  -exclude content and also foldername /tmp: '- /tmp/ \ + */'
+#  -exclude content of each .ssh but include foldername: '- /**/.ssh/* \ + */'
+#
+#include everything except /tmp/:
+#- /tmp/
+#same but include /tmp/ as an empty folder:
+#- /tmp/*
+#include only /var/www/:
+#+ /var/
+#+ /var/www/
+#+ /var/www/**
+#- *
+#same but also include folder structure:
+#+ /var/www/**
+#+ */
+#- *
+
+
+
+
+#pattern list for / (include by default):
++ /
+
+#+ /boot/
+#+ /boot/**
+#- *
+
+- /lost+found/*
+- /*.bak*
+- /*.old*
+#- /backup/*
+#- /boot/*
+#- /etc/ssh/ssh_host*
+#- /home/*
+- /media/*
+- /mnt/*/*
+#- /opt/*
+- /opt/fedora*/data/*
+- /postgresql/opt/fedora*/data/*
+- /postgresql/opt/fedora*/lucene/*
+- /postgresql/opt/fedora*/tomcat*/logs/*
+- /postgresql/opt/fedora*/tomcat*/temp/*
+- /postgresql/opt/fedora*/tomcat*/work/*
+- /postgresql/*/main/pg_log/*
+- /postgresql/*/main/pg_xlog/*
+- /postgresql/*/main/postmaster.opts
+- /postgresql/*/main/postmaster.pid
+#- /postgresql/*/main/*/*
+- /proc/*
+- /root/old/*
+#- /root/.bash_history
+- /root/.mc/*
+#- /root/.ssh/*openssh*
+- /root/.viminfo
+- /root/tmp/*
+#- /srv/*
+- /sys/*
+- /tmp/*
+#- /usr/local/franz/logstat/logstat.log
+- /var/cache/*
+- /var/lib/mysql/*
+- /var/lib/postgresql/*/main/*/*
+- /var/log/*
+#- /var/spool/*
+- /var/tmp/*
+
+#pattern list for /backup/ (exclude by default):
++ /backup/
+- /backup/lost+found/*
+- /backup/*.bak*
+- /backup/*.old*
++ /backup/snapshot/
++ /backup/snapshot/rsync/
++ /backup/snapshot/rsync/**
+- /backup/snapshot/*
+- /backup/*
++ /mnt/
++ /mnt/*/
++ /mnt/*/backup/
++ /mnt/*/backup/snapshot/
++ /mnt/*/backup/snapshot/rsync/
++ /mnt/*/backup/snapshot/rsync/**
+- /mnt/*/backup/snapshot/
+- /mnt/*/backup/
+
+#pattern list for /boot/ (include by default):
++ /boot/
+- /boot/lost+found/*
+- /boot/*.bak*
+- /boot/*.old*
++ /boot/**
+
+#pattern list for /home/ (include by default):
++ /home/
+- /home/lost+found/*
+- /home/*.bak*
+- /home/*.old*
+- /home/xen/*
++ /home/**
+
+#include folder structure by default:
+#+ */
+#include everything by default:
++ *
+#exclude everything by default:
+#- *
+#eof
+

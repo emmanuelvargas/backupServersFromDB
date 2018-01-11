@@ -1,0 +1,7 @@
+
+QHBip='IP'
+QHBport='3306'
+QHBdb='backup'
+QHBlogin='qhbSERVER2'
+QHBpassword='tata'
+

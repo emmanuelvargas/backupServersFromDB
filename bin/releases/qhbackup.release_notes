@@ -1,0 +1,29 @@
+1.1.3
+Adding the possibility to define a specific ssh user on each server
+
+1.1.2
+-d servers selection is now done from Prod Cluster DB
+
+1.1.1
+Add env variable WARNING_SIZE_INCREASE_RATIO: raise a warning in the logs if the server backup size vs previous size exceed the ratio
+Add a check to exit 200 if the list of server returned by the DB request is empty.
+
+1.1.0
+Add env variable MULTI_PROCESS: if set to true, multiple qhbackup can be start simultaneously
+Add variable MYPID: Contain the running instance PID
+Remove backupdb function and execution
+Move howmany function to qhbFuntions.sh
+Remove all the chattr options
+Remove the md5 signature
+Add conf variables PRE_BACKUP and POST_BACKUP which will be used to define if we have to execute a remote script on the server before or after the rsync
+Add conf variable BACKUP_SCRIPTS_LOCATION defining the scripts location on the backuped server - scripts must be suffixed .pre or .post
+Add variable PID_PATH to locate temporary pid file in a separate location (default: $APP_PATH/tmp)
+Env variable VERBOSE is now to be define as option -V
+
+1.0.0
+Add env variable REGION
+Add -q to ssh option during rsync cmd to have more relevant logs
+
+0.9.9
+Add variable RM_RANGE which define the backup range to keep
+Correction on the CHATTR_OPT usage

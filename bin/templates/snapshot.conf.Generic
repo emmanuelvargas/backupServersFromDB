@@ -1,0 +1,22 @@
+- /home/developers
+
+- /data/authreports2/*
+- /data/prod_config_files/config_files/*
+- /data/production-scripts/ua_storage/out/*
+- /data/backup/backup_*
++ /data/qhbackup/snapshot/*/conf/
++ /data/qhbackup/snapshot/*/conf/**
+- /data/qhbackup/snapshot/*/*
+- /data/aptly
+
+- /home/backup/archives/*
+- /home/backup_*
+- /home/build
+- /home/OLD
+- /home/old
+
+- *.lock
+- *.pcap
+- *.pcap.gz
++ */files/*/*.msg
+#eof

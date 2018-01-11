@@ -1,0 +1,8 @@
+qhbackup.conf:
+BACKUP_SCRIPTS_LOCATION="/usr/share/qhbackup"
+
+keys ssh:
+/../.ssh/rsakeys
+/data/backup/.ssh/rsakeys
+/root/.ssh/rsync_rsa
+

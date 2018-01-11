@@ -1,0 +1,445 @@
+#!/bin/bash
+###########
+# Copyright (C) 2018  Emmanuel Vargas <emmanuel.vargas@gmail.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Dump remote sql database and backup remote server incrementally with rsync and hard-links
+# Adapted from rsync-snapshot by Francois Scheurer / 23-03-2007
+# http://blog.pointsoftware.ch/index.php/howto-local-and-remote-snapshot-backup-using-rsync-with-hard-links/
+##########
+
+RELEASE="1.1.4"
+MYPID="$(echo $$)"
+
+usage()
+{
+  cat << "EOF"
+
+USAGE: qhbackup OPTION [SERVER]
+
+  -h    This help
+  -s    Process backup for only listed [SERVERS]
+  -a    Process backup for all the servers having a directory defined (except for those in servers.exclude)
+  -d    Process backup with the server list retrieved from DB
+  -m    Activate ability to start multiple instance
+  -t    Activate TEST MODE: ***No action will be done***
+  -V    Verbose mode
+
+PURPOSE: create a snapshot backup of the whole filesystem into the folder
+  SNAPSHOT_DST (configured in conf file).
+  If HOST is 'localhost' it is replaced with the local hostname.
+  If HOST is a remote host then rsync over ssh is used to transfer the files
+  with a delta-transfer algorithm to transfer only minimal parts of the files
+  and improve speed; rsync uses for this the previous backup as reference.
+  This reference is also used to create hard links instead of files when
+  possible and thus save disk space. If original and reference file have
+  identical content but different timestamps or permissions then no hard link
+  is created.
+  A rotation of all backups renames snapshot.X into snapshot.X+1 and removes
+  backups with X>${OLDEST_SNAPSHOT}.
+  The snapshots folders are protected read-only against all users including
+  root using 'chattr'.
+  The --recheck option forces a sync of all files even if they have same mtime
+  & size; it is can verify a backup and fix corrupted files;
+  --recheck recalculates also the MD5 integrity signatures without using the
+  last signature-file as precalculation.
+  Some features like filter rules, MD5, chattr, bwlimit and per server retention
+  policy can be configured by modifying the .env & .conf files.
+
+GENERAL FILES:
+    qhbackup  the backup script
+    backup.env       environment file
+    qhbackup.conf      configuration file
+BY SERVER FILES:
+    snapshot.conf      the rsync filter rules
+    server.conf        specific server configuration
+
+EOF
+}
+
+MODE=""
+VERBOSE=false
+while getopts "hs:admtV" OPTION
+do
+     case $OPTION in
+         h)
+                usage
+                exit 1
+                ;;
+        s)
+                if [ -n "$MODE" ]
+                then
+                        echo "-s -a -d ARE EXCLUSIVE, please try qhbackup -h"
+                        exit 1
+                fi
+                MODE=server
+                SERVERS=$OPTARG
+                if [ "$SERVERS" = "" ]
+                then
+                        usage
+                        exit 1
+                fi
+                ;;
+        a)
+                if [ -n "$MODE" ]
+                then
+                        echo "-s -a -d ARE EXCLUSIVE, please try qhbackup -h"
+                        exit 1
+                fi
+                MODE=all
+                ;;
+        d)
+                if [ -n "$MODE" ]
+                then
+                        echo "-s -a -d ARE EXCLUSIVE, please try qhbackup -h"
+                        exit 1
+                fi
+                MODE=db
+                ;;
+        m)
+                MULTI_PROCESS=true
+                ;;
+        t)
+                TEST_MODE=true
+                ;;
+        V)
+                VERBOSE=true
+                ;;
+        esac
+done
+if [ "$MODE" = "" ]
+then
+        usage
+        exit 1
+fi
+
+# Loading General environment
+APP_PATH=$(cd `dirname $0`; pwd)
+CONF_PATH="$APP_PATH/conf"
+if [ ! -f "$CONF_PATH/backup.env" ]
+then
+        echo "backup.env does not exist: no environment file, exiting"
+        exit 1
+fi
+source $CONF_PATH/backup.env
+if [ ! -f "$APP_PATH/qhbFunctions.sh" ]
+then
+        echo "qhbFunctions.sh does not exist: exiting"
+        exit 1
+fi
+source $APP_PATH/qhbFunctions.sh
+if [ ! -f "$CONF_PATH/qhbDB.conf" ]
+then
+        echo "WARNING:qhbDB.conf does not exist: all DB functionnality will be disabled"
+        qhbDBdisabled=true
+else
+        qhbDBdisabled=false
+        source $CONF_PATH/qhbDB.conf
+fi
+logall "Environment loaded."
+logall "Release $RELEASE"
+[[ $TEST_MODE ]] && logall "Activating TEST MODE - No action will be done"
+logall "We are processing backup in mode $MODE."
+if $IN_WEEKEND
+then
+        logall "In WeekEnd"
+else
+        logall "In WeekDays"
+fi
+
+# make sure we're running as root
+if (($(id -u) != 0))
+then
+	log "Sorry, must be root. Exiting..."
+	logall " === Snapshot failed. ==="
+	exit 2
+fi
+
+if [ ! -f "$CONF_PATH/qhbackup.conf" ]
+then
+	logall "qhbackup.conf not exist: no configuration file, exiting"
+	exit 1
+fi
+
+if [ ! $MULTI_PROCESS ]
+then
+        while [ -f "$PID_PATH/qhbackup.*.pid" ];
+        do
+        	logall "$(ls $PID_PATH/qhbackup.*.pid) existing: qhbackup already launched, waiting for 10 minutes..."
+                sleep 600
+        done
+        logall "Creating ${PID_PATH}/qhbackup.pid..."
+        echo ${MYPID} > "${PID_PATH}/qhbackup.pid"
+else
+        logall "Creating ${PID_PATH}/qhbackup.${MYPID}.pid..."
+        logall "BE CAREFULL: multi process mode activated"
+        echo ${MYPID} > "${PID_PATH}/qhbackup.${MYPID}.pid"
+fi
+
+# List servers to be backuped
+case $MODE in
+        server)
+                REMOTE_HOSTS=$SERVERS
+                ;;
+        all)
+                REMOTE_HOSTS="`find $SNAPSHOT_DST/* -maxdepth 0 -printf %f' '`"
+                ;;
+        db)
+                SELECT="SELECT name"
+                #FROM="FROM Server"
+                FROM="FROM prodTools_server"
+                WHERE="WHERE is_backuped = '1' AND server_region LIKE \"$REGION\""
+                REMOTE_HOSTS="$(${MYSQL} ${DBprodCluster} -Bn --skip-column-names -e "$SELECT $FROM $WHERE ORDER BY backup_priority DESC;")"
+                if [[ -z ${REMOTE_HOSTS} ]]
+                then
+                        logall " No server returned from DB request, exiting. "
+                        exit 200
+                fi
+                ;;
+esac
+
+SERVERS_TO_BACKUP=""
+for REMOTE_HOST in ${REMOTE_HOSTS}
+do
+        # Loading server configuration
+        loadserverconf
+
+        if ! $ACTIVE
+        then
+                logall " === Server backup is not active - skipping ($DESCRIPTION) ==="
+                continue
+        fi
+
+        if ! $IN_WEEKEND
+        then
+                if [[ "$PERIOD" == "W" ]] || [[ "$PERIOD" == "w" ]]
+                then
+                        logall " === Weekly backup and we are `date +%A` - skipping ($DESCRIPTION) ==="
+                        continue
+                fi
+        fi
+        SERVERS_TO_BACKUP="$SERVERS_TO_BACKUP $REMOTE_HOST"
+done
+unset REMOTE_HOST
+
+# Process rsync for each server
+logall " === START OF FILE TRANSFER ==="
+for REMOTE_HOST in ${SERVERS_TO_BACKUP}
+do
+        # Loading server configuration
+        loadserverconf
+
+        if [[ "${LIMIT_HOUR_FOR_RSYNC}" != "" ]] && [[ `date "+%k"` -ge ${LIMIT_HOUR_FOR_RSYNC} ]]
+        then
+                logall " === LIMIT_HOUR_FOR_RSYNC is defined to ${LIMIT_HOUR_FOR_RSYNC} and current hour is `date "+%k"` - skipping (${DESCRIPTION}) ==="
+                SERVERS_NOT_BACKUPED="${SERVERS_NOT_BACKUPED} ${REMOTE_HOST}"
+                continue
+        fi
+        
+        #### We will add here the prebackup optional scripts ####
+        if [[ ! ${TEST_MODE} ]]&&[[ ${PRE_BACKUP} ]]
+        then
+                logall " === Running Pre Backup script(s) on the server - Logs located in ${LOG_FILE} ==="
+                CMD="cd ${BACKUP_SCRIPTS_LOCATION}; for SCRIPT in \$(ls *.pre); do echo \"\${SCRIPT}:start\"; /bin/bash \$SCRIPT; echo \"\${SCRIPT}:end\"; done"
+                ${SSH} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${HOST_PORT} -i ${SSH_KEY} -l ${SSH_USER} ${REMOTE_HOST} "${CMD}" >> ${LOG_FILE} 2>&1
+        fi
+
+        # Create the link-dest destinations for rsync
+        LNKDST=""
+        # We add the 9 last backups of the current server
+        for i in {1..9}
+        do
+                j=$(printf "%.3d" "${i}")
+                if [[ -d "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${j}" ]]
+                then
+                        LNKDST="${LNKDST} --link-dest=${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${j}"
+                fi
+        done
+
+        if [ "${REMOTE_HOST}" != "${BACKUP_SERVER}" ] #option for a remote server
+        then
+                SOURCE="${REMOTE_HOST}:${SOURCE}"
+                CURRENTOPTION="${OPTION} \
+                        --compress \
+                        --rsh=\"ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${HOST_PORT} -i ${SSH_KEY} -l ${SSH_USER}\""
+        else
+                CURRENTOPTION="${OPTION} "
+        fi
+        logall " === Snapshot rsync is created into ${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000 ($DESCRIPTION) - $BWLIMIT KB/s ==="
+        START_DATE=$(date +%s)
+
+        # ------------- create the snapshot backup -----------------------------
+        # perform the filesystem backup using rsync and hard-links to the latest snapshot
+        # Note:
+        #   -rsync behaves like cp --remove-destination by default, so the destination
+        #    is unlinked first.  If it were not so, this would copy over the other
+        #    snapshot(s) too!
+        #   -use --link-dest to hard-link when possible with previous snapshot,
+        #    timestamps, permissions and ownerships are preserved
+        log "Creating folder ${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000 ..."
+        [[ ! $TEST_MODE ]]&&${MKDIR} -p "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000"
+        [[ ! $TEST_MODE ]]&&${CHMOD} 775 "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000"
+        log "Creating backup of ${REMOTE_HOST} into ${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000"
+        if [ -n "${LNKDST}" ]
+        then
+                log " hardlinked with ${LNKDST//--link-dest=/} ..."
+        else
+                log " not hardlinked ..."
+        fi
+        log " with rsync BWLIMIT set to $BWLIMIT KB/s."
+        if [[ ! $TEST_MODE ]]
+        then
+                eval ${RSYNC} \
+                        -vv \
+                        ${CURRENTOPTION} \
+                        --include-from="${SNAPSHOT_DST}/${REMOTE_HOST}/conf/snapshot.conf" \
+                        ${LNKDST} \
+                        --bwlimit=${BWLIMIT} \
+                        "${SOURCE}" "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000" >>"${SNAPSHOT_DST}/${REMOTE_HOST}/log" 2>&1
+                RES=$?
+                if [ "${RES}" -ne 0 ] && [ "${RES}" -ne 23 ] && [ "${RES}" -ne 24 ]
+                then
+                        log "Sorry, error in rsync execution (value ${RES})."
+                        logall " === Snapshot rsync failed. ==="
+                        SERVERS_NOT_BACKUPED="$SERVERS_NOT_BACKUPED $REMOTE_HOST"
+                else
+                        SERVERS_BACKUPED="$SERVERS_BACKUPED $REMOTE_HOST"
+                        PREVIOUS_RSYNC_STATS_SIZE="$(grep -a ${REMOTE_HOST} $LOG_PATH/$APP_NAME/stats | tail -n 1 | cut -d';' -f4)"
+                        RSYNC_STATS_SIZE="`tail -n 1 ${SNAPSHOT_DST}/${REMOTE_HOST}/log | cut -d' ' -f4 | sed 's/,//g'`"
+                        RSYNC_STATS_SPEED="`tail -n 2 ${SNAPSHOT_DST}/${REMOTE_HOST}/log | head -n 1 | cut -d' ' -f9 | sed 's/,//g'`"
+                        logall " === Snapshot rsync successfully done in $(($(date +%s) - ${START_DATE})) sec. ($((($(date +%s) - ${START_DATE})/60)) min.) / $(echo "scale=3;$RSYNC_STATS_SIZE/1024/1024/1024" | bc -q 2>/dev/null)GBytes / $(echo "scale=2; $RSYNC_STATS_SPEED/1024/1024*8" | bc -q 2>/dev/null)MBits/sec ==="
+                        echo "$DATE;$REMOTE_HOST;$(($(date +%s) - ${START_DATE}));$RSYNC_STATS_SIZE;$RSYNC_STATS_SPEED;$IN_WEEKEND;$DESCRIPTION" >> $LOG_PATH/$APP_NAME/stats
+                        if [[ -n ${PREVIOUS_RSYNC_STATS_SIZE} ]]
+                        then
+                                SIZE_INCREASE_RATIO=$(echo "scale=2; ${RSYNC_STATS_SIZE}/${PREVIOUS_RSYNC_STATS_SIZE}" | bc -q 2>/dev/null)
+                                [[ $(echo "${SIZE_INCREASE_RATIO}>${WARNING_SIZE_INCREASE_RATIO}" | bc -q 2>/dev/null) -eq 1 ]]&&log "WARNING: Backup size increase of $(echo "(${SIZE_INCREASE_RATIO}-1)*100" | bc -q 2>/dev/null)% compared to last backup."
+                        fi
+                fi
+        fi
+        [[ ! $TEST_MODE ]]&&mv "${SNAPSHOT_DST}/${REMOTE_HOST}/log" "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000/log"
+        [[ ! $TEST_MODE ]]&&${GZIP} -f "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.000/log"
+
+        #### We will add here the postbackup optional scripts ####
+        if [[ ! $TEST_MODE ]]&&[[ $POST_BACKUP ]]
+        then
+                logall " === Running Post Backup script(s) on the server ==="
+                CMD="cd ${BACKUP_SCRIPTS_LOCATION}; for SCRIPT in \$(ls *.post); do echo \"\$SCRIPT:start\"; /bin/bash \$SCRIPT; echo \"\$SCRIPT:end\"; done"
+                ${SSH} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${HOST_PORT} -i ${SSH_KEY} -l ${SSH_USER} $REMOTE_HOST "$CMD" >> $LOG_FILE 2>&1
+        fi
+done
+unset REMOTE_HOST
+logall " === END OF FILE TRANSFER ==="
+
+OLDEST_BACKUP=$(echo ${RM_RANGE} | awk '{ print $1; }')
+# Rotate the backup
+for REMOTE_HOST in ${SERVERS_BACKUPED}
+do
+        # Loading server configuration
+        loadserverconf
+
+        # rotate the backups
+        if [ -d "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${OLDEST_SNAPSHOT}" ] #remove oldest_snapshot
+        then
+                log "Removing ${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${OLDEST_SNAPSHOT} ..."
+                [[ ! $TEST_MODE ]]&&rm -rf "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${OLDEST_SNAPSHOT}"
+        fi
+        #for i in {${OLDEST_SNAPSHOT}..000}
+        for i in {600..000}
+        do
+                if [ -d "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${i}" ]
+                then
+                        let j=$((10#$i))
+                        let j=$((${j}+1))
+                        j=$(printf "%.3d" "${j}")
+                        log "Renaming ${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${i} into ${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${j} ..."
+                        [[ ! $TEST_MODE ]]&&mv "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${i}" "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${j}"
+               fi
+        done
+
+        # ------------- remove some old backups --------------------------------
+        unset b
+        for a in $RM_RANGE
+        do
+              	if [ -z $b ]
+              	then
+               		let b=a
+               	else
+               		let c=a+1
+               		let f=0 #this flag is set to 1 when we find the 1st snapshot in the range b..a
+               		for i in $(eval echo $(printf "{%.3d..%.3d}" "${b}" "${c}"))
+               		do
+               			if [ -d "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${i}" ]
+               			then
+               				if [ "${f}" -eq 0 ]
+               				then
+               					let f=1
+               				else
+               					logall "Removing ${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${i} ..."
+               					[[ ! $TEST_MODE ]]&&rm -rf "${SNAPSHOT_DST}/${REMOTE_HOST}/${NAME}.${i}"
+               				fi
+               			fi
+               		done
+               		let b=a
+               	fi
+        done
+done
+unset REMOTE_HOST
+# Update last backup dates in QuantInfra DB
+if ! $qhbDBdisabled
+then
+        for REMOTE_HOST in ${SERVERS_TO_BACKUP}
+        do
+                loadserverconf
+                if [[ ${ID_QUANTINFRA} != "" ]]
+                then
+                        UPDATE="UPDATE Server"
+                        if [[ ${SERVERS_NOT_BACKUPED} =~ ${REMOTE_HOST} ]]
+                        then
+                                UPDATE="$UPDATE SET last_backup_launched=\"$DATEDB\""
+                        else
+                                UPDATE="$UPDATE SET last_backup_launched=\"$DATEDB\", last_backup_succeed=\"$DATEDB\""
+                        fi
+                        UPDATE="$UPDATE WHERE id = ${ID_QUANTINFRA} AND name LIKE \"$REMOTE_HOST\" LIMIT 1"
+                        log "$UPDATE"
+                        ${MYSQL} ${DBquantInfra} -Bn -e "$UPDATE;"
+                fi
+        done
+        unset REMOTE_HOST
+fi
+
+# Send an email in case of backup error
+if $SENDMAIL && [[ $SERVERS_NOT_BACKUPED || $ERROR_LOG_SQL ]]
+then
+        sendEmail -q -s '127.0.0.1' -f $MAIL_FROM -t $MAIL_TO -u "[backup] $BACKUP_SERVER" -m "Errors append during the backup ($DATE).\nConnect on the server "$BACKUP_SERVER" and check backup logs (/var/log/backup/) for the server(s) $SERVERS_NOT_BACKUPED\n\n$ERROR_LOG_SQL"
+        if [[ $? > 0 ]]
+        then
+                logall "WARNING: Mail has not been sent"
+        else
+                logall "Mail sent"
+        fi
+fi
+
+# Remove lock file
+if [ ! $MULTI_PROCESS ]
+then
+        rm "${PID_PATH}/qhbackup.pid"
+        logall "${PID_PATH}/qhbackup.pid removed..."
+else
+        rm "${PID_PATH}/qhbackup.${MYPID}.pid"
+        logall "${PID_PATH}/qhbackup.${MYPID}.pid removed..."
+fi
+
+exit 0
+#eof
